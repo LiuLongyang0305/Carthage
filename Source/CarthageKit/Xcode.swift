@@ -60,9 +60,12 @@ internal func frameworkSwiftVersionIfIsSwiftFramework(_ frameworkURL: URL) -> Si
 
 /// Determines the Swift version of a framework at a given `URL`.
 internal func frameworkSwiftVersion(_ frameworkURL: URL) -> SignalProducer<String, SwiftVersionError> {
+	// Fall back to dSYM version parsing if header is not present
+	guard let swiftHeaderURL = frameworkURL.swiftHeaderURL() else {
+		return dSYMSwiftVersion(frameworkURL.appendingPathExtension("dSYM"))
+	}
 
 	guard
-		let swiftHeaderURL = frameworkURL.swiftHeaderURL(),
 		let data = try? Data(contentsOf: swiftHeaderURL),
 		let contents = String(data: data, encoding: .utf8),
 		let swiftVersion = parseSwiftVersionCommand(output: contents)
@@ -73,10 +76,12 @@ internal func frameworkSwiftVersion(_ frameworkURL: URL) -> SignalProducer<Strin
 	return SignalProducer(value: swiftVersion)
 }
 
-internal func dSYMSwiftVersion(_ dSYMURL: URL) -> SignalProducer<String, SwiftVersionError> {
-
+private func dSYMSwiftVersion(_ dSYMURL: URL) -> SignalProducer<String, SwiftVersionError> {
 	// Pick one architecture
-	guard let arch = architecturesInPackage(dSYMURL).first()?.value else {
+	guard let arch = architecturesInPackage(
+		dSYMURL,
+		xcrunQuery: ["lipo", "-info"]
+	).flatten().first()?.value else {
 		return SignalProducer(error: .unknownFrameworkSwiftVersion(message: "No architectures found in dSYM."))
 	}
 
@@ -132,10 +137,34 @@ internal func isSwiftFramework(_ frameworkURL: URL) -> Bool {
 internal func checkSwiftFrameworkCompatibility(_ frameworkURL: URL, usingToolchain toolchain: String?) -> SignalProducer<URL, SwiftVersionError> {
 	return SignalProducer.combineLatest(swiftVersion(usingToolchain: toolchain), frameworkSwiftVersion(frameworkURL))
 		.attemptMap { localSwiftVersion, frameworkSwiftVersion in
-			return localSwiftVersion == frameworkSwiftVersion
+			return localSwiftVersion == frameworkSwiftVersion || isModuleStableAPI(localSwiftVersion, frameworkSwiftVersion, frameworkURL)
 				? .success(frameworkURL)
 				: .failure(.incompatibleFrameworkSwiftVersions(local: localSwiftVersion, framework: frameworkSwiftVersion))
 		}
+}
+
+/// Determines whether a local swift version and a framework combination are considered module stable
+internal func isModuleStableAPI(_ localSwiftVersion: String,
+								_ frameworkSwiftVersion: String,
+								_ frameworkURL: URL) -> Bool {
+	guard let localSwiftVersionNumber = determineMajorMinorVersion(localSwiftVersion),
+		let frameworkSwiftVersionNumber = determineMajorMinorVersion(frameworkSwiftVersion),
+		let swiftModuleURL = frameworkURL.swiftmoduleURL() else { return false }
+
+	let hasSwiftInterfaceFile = try? FileManager.default.contentsOfDirectory(at: swiftModuleURL,
+																			 includingPropertiesForKeys: nil,
+																			 options: []).first { (url) -> Bool in
+			return url.lastPathComponent.contains("swiftinterface")
+		} != nil
+
+	return localSwiftVersionNumber >= 5.1 && frameworkSwiftVersionNumber >= 5.1 && hasSwiftInterfaceFile == true
+}
+
+/// Attempts to return a `Double` representing the major/minor version components parsed from a given swift version, otherwise returns `nil`.
+private func determineMajorMinorVersion(_ swiftVersion: String) -> Double? {
+	guard let range = swiftVersion.range(of: "^(\\d+)\\.(\\d+)", options: .regularExpression) else { return nil }
+
+	return Double(swiftVersion[range])
 }
 
 /// Emits the framework URL if it is compatible with the build environment and errors if not.
@@ -149,13 +178,13 @@ internal func checkFrameworkCompatibility(_ frameworkURL: URL, usingToolchain to
 
 /// Creates a task description for executing `xcodebuild` with the given
 /// arguments.
-public func xcodebuildTask(_ tasks: [String], _ buildArguments: BuildArguments) -> Task {
-	return Task("/usr/bin/xcrun", arguments: buildArguments.arguments + tasks)
+public func xcodebuildTask(_ tasks: [String], _ buildArguments: BuildArguments, environment: [String: String]? = nil) -> Task {
+	return Task("/usr/bin/xcrun", arguments: buildArguments.arguments + tasks, environment: environment)
 }
 
 /// Creates a task description for executing `xcodebuild` with the given
 /// arguments.
-public func xcodebuildTask(_ task: String, _ buildArguments: BuildArguments) -> Task {
+public func xcodebuildTask(_ task: String, _ buildArguments: BuildArguments, environment: [String: String]? = nil) -> Task {
 	return xcodebuildTask([task], buildArguments)
 }
 
@@ -164,7 +193,7 @@ public func xcodebuildTask(_ task: String, _ buildArguments: BuildArguments) -> 
 public func buildableSchemesInDirectory( // swiftlint:disable:this function_body_length
 	_ directoryURL: URL,
 	withConfiguration configuration: String,
-	forPlatforms platforms: Set<Platform> = []
+	forPlatforms platformAllowList: Set<SDK>? = nil
 ) -> SignalProducer<(Scheme, ProjectLocator), CarthageError> {
 	precondition(directoryURL.isFileURL)
 	let locator = ProjectLocator
@@ -196,7 +225,7 @@ public func buildableSchemesInDirectory( // swiftlint:disable:this function_body
 			/// from a workspace, then it might include additional targets that would trigger our
 			/// check.
 			let buildArguments = BuildArguments(project: project, scheme: scheme, configuration: configuration)
-			return shouldBuildScheme(buildArguments, platforms)
+			return shouldBuildScheme(buildArguments, platformAllowList)
 				.filter { $0 }
 				.map { _ in (scheme, project) }
 		}
@@ -210,7 +239,7 @@ public func buildableSchemesInDirectory( // swiftlint:disable:this function_body
 					switch project {
 					case .workspace where schemes.contains(scheme):
 						let buildArguments = BuildArguments(project: project, scheme: scheme, configuration: configuration)
-						return shouldBuildScheme(buildArguments, platforms)
+						return shouldBuildScheme(buildArguments, platformAllowList)
 							.filter { $0 }
 							.map { _ in project }
 
@@ -229,7 +258,7 @@ public func buildableSchemesInDirectory( // swiftlint:disable:this function_body
 			if !schemes.isEmpty {
 				return .init(schemes)
 			} else {
-				return .init(error: .noSharedFrameworkSchemes(.git(GitURL(directoryURL.path)), platforms))
+				return .init(error: .noSharedFrameworkSchemes(.git(GitURL(directoryURL.path)), platformAllowList ?? []))
 			}
 		}
 }
@@ -262,7 +291,7 @@ public func schemesInProjects(_ projects: [(ProjectLocator, [Scheme])]) -> Signa
 }
 
 /// Describes the type of frameworks.
-internal enum FrameworkType {
+public enum FrameworkType: String, Codable {
 	/// A dynamic framework.
 	case dynamic
 
@@ -427,29 +456,24 @@ private func shouldBuildFrameworkType(_ frameworkType: FrameworkType?) -> Bool {
 }
 
 /// Determines whether the given scheme should be built automatically.
-private func shouldBuildScheme(_ buildArguments: BuildArguments, _ forPlatforms: Set<Platform>) -> SignalProducer<Bool, CarthageError> {
+private func shouldBuildScheme(
+	_ buildArguments: BuildArguments,
+	_ platformAllowList: Set<SDK>? = nil
+) -> SignalProducer<Bool, CarthageError> {
 	precondition(buildArguments.scheme != nil)
 
-	return BuildSettings.load(with: buildArguments)
-		.flatMap(.concat) { settings -> SignalProducer<FrameworkType?, CarthageError> in
-			let frameworkType = SignalProducer(result: settings.frameworkType)
+	let setSignal = SDK.setsFromJSONShowSDKsWithFallbacks.promoteError(CarthageError.self)
 
-			if forPlatforms.isEmpty {
-				return frameworkType
-					.flatMapError { _ in .empty }
-			} else {
-				return settings.buildSDKs
-					.filter { forPlatforms.contains($0.platform) }
-					.flatMap(.merge) { _ in frameworkType }
-					.flatMapError { _ in .empty }
-			}
+	return BuildSettings.load(with: buildArguments)
+		.flatMap(.merge) { (settings) -> SignalProducer<Set<SDK>, CarthageError> in
+			let supportedFrameworks = settings.buildSDKRawNames.map { sdk in SDK(name: sdk, simulatorHeuristic: "") }
+			guard settings.frameworkType.recover(nil) != nil else { return .empty }
+			return setSignal.map { $0.intersection(supportedFrameworks) }
 		}
-		.filter(shouldBuildFrameworkType)
-		// If we find any framework target, we should indeed build this scheme.
-		.map { _ in true }
-		// Otherwise, nope.
-		.concat(value: false)
-		.take(first: 1)
+		.reduce(into: false) {
+			let filter = (platformAllowList ?? $1).contains
+			$0 = $0 || $1.firstIndex(where: filter) != nil
+		}
 }
 
 /// Aggregates all of the build settings sent on the given signal, associating
@@ -556,7 +580,7 @@ private func mergeBuildProducts(
 }
 
 /// A callback function used to determine whether or not an SDK should be built
-public typealias SDKFilterCallback = (_ sdks: [SDK], _ scheme: Scheme, _ configuration: String, _ project: ProjectLocator) -> Result<[SDK], CarthageError>
+public typealias SDKFilterCallback = (_ sdk: Set<SDK>, _ scheme: Scheme, _ configuration: String, _ project: ProjectLocator) -> Result<Set<SDK>, CarthageError>
 
 /// Builds one scheme of the given project, for all supported SDKs.
 ///
@@ -591,37 +615,27 @@ public func buildScheme( // swiftlint:disable:this function_body_length cyclomat
 					// Filter out SDKs that require bitcode when bitcode is disabled in
 					// project settings. This is necessary for testing frameworks, which
 					// must add a User-Defined setting of ENABLE_BITCODE=NO.
-					return settings.bitcodeEnabled.value == true || ![.tvOS, .watchOS].contains(sdk)
+					return settings.bitcodeEnabled.value == true || !["appletvos", "watchos"].contains(sdk.rawValue)
 				}
 				.map { _ in sdk }
 		}
-		.reduce(into: [:]) { (sdksByPlatform: inout [Platform: Set<SDK>], sdk: SDK) in
-			let platform = sdk.platform
+		.reduce(into: [] as Set) { $0.formUnion([$1]) }
+		.flatMap(.concat) { sdks -> SignalProducer<(String, [SDK]), CarthageError> in
+			if sdks.isEmpty { fatalError("No SDKs found for scheme \(scheme)") }
+			// fatalError in unlikely case that propogated logic error from Carthage authors
+			// has become unrecoverable
 
-			if var sdks = sdksByPlatform[platform] {
-				sdks.insert(sdk)
-				sdksByPlatform.updateValue(sdks, forKey: platform)
-			} else {
-				sdksByPlatform[platform] = [sdk]
-			}
+			return sdkFilter(sdks, scheme, options.configuration, project).analysis(
+				ifSuccess: { filteredSDKs in
+					SignalProducer<(String, [SDK]), CarthageError>(
+						Dictionary(grouping: filteredSDKs, by: { $0.relativePath }).lazy.map { ($0, $1) }
+					)
+				}, ifFailure: { error in
+					SignalProducer<(String, [SDK]), CarthageError>(error: error)
+				})
 		}
-		.flatMap(.concat) { sdksByPlatform -> SignalProducer<(Platform, [SDK]), CarthageError> in
-			if sdksByPlatform.isEmpty {
-				fatalError("No SDKs found for scheme \(scheme)")
-			}
-
-			let values = sdksByPlatform.map { ($0, Array($1)) }
-			return SignalProducer(values)
-		}
-		.flatMap(.concat) { platform, sdks -> SignalProducer<(Platform, [SDK]), CarthageError> in
-			let filterResult = sdkFilter(sdks, scheme, options.configuration, project)
-			return SignalProducer(result: filterResult.map { (platform, $0) })
-		}
-		.filter { _, sdks in
-			return !sdks.isEmpty
-		}
-		.flatMap(.concat) { platform, sdks -> SignalProducer<TaskEvent<URL>, CarthageError> in
-			let folderURL = rootDirectoryURL.appendingPathComponent(platform.relativePath, isDirectory: true).resolvingSymlinksInPath()
+		.flatMap(.concat) { relativePath, sdks -> SignalProducer<TaskEvent<URL>, CarthageError> in
+			let folderURL = rootDirectoryURL.appendingPathComponent(relativePath, isDirectory: true).resolvingSymlinksInPath()
 
 			switch sdks.count {
 			case 1:
@@ -750,10 +764,10 @@ private func build(sdk: SDK, with buildArgs: BuildArguments, in workingDirectory
 					if let selectedSimulator = selectAvailableSimulator(of: sdk, from: data) {
 						return .init(value: selectedSimulator)
 					} else {
-						return .init(error: CarthageError.noAvailableSimulators(platformName: sdk.platform.rawValue))
+						return .init(error: CarthageError.noAvailableSimulators(platformName: sdk.platformSimulatorlessFromHeuristic))
 					}
 				}
-				.map { "platform=\(sdk.platform.rawValue) Simulator,id=\($0.udid.uuidString)" }
+				.map { "platform=\(sdk.platformSimulatorlessFromHeuristic) Simulator,id=\($0.udid.uuidString)" }
 		}
 		return SignalProducer(value: nil)
 	}
@@ -782,7 +796,7 @@ private func build(sdk: SDK, with buildArgs: BuildArguments, in workingDirectory
 
 					// Do not copy build products that originate from the current project's own carthage dependencies
 					let projectURL = URL(fileURLWithPath: projectPath)
-					let dependencyCheckoutDir = workingDirectoryURL.appendingPathComponent(carthageProjectCheckoutsPath, isDirectory: true)
+					let dependencyCheckoutDir = workingDirectoryURL.appendingPathComponent(Constants.checkoutsFolderPath, isDirectory: true)
 					return !dependencyCheckoutDir.hasSubdirectory(projectURL)
 				}
 				.flatMap(.concat) { settings in resolveSameTargetName(for: settings) }
@@ -911,13 +925,7 @@ public func buildInDirectory( // swiftlint:disable:this function_body_length
 				let initialValue = (project, scheme)
 
 				let wrappedSDKFilter: SDKFilterCallback = { sdks, scheme, configuration, project in
-					let filteredSDKs: [SDK]
-					if options.platforms.isEmpty {
-						filteredSDKs = sdks
-					} else {
-						filteredSDKs = sdks.filter { options.platforms.contains($0.platform) }
-					}
-					return sdkFilter(filteredSDKs, scheme, configuration, project)
+					return sdkFilter((options.platforms /* allow list */ ?? sdks).intersection(sdks), scheme, configuration, project)
 				}
 
 				return buildScheme(
@@ -977,6 +985,42 @@ public func buildInDirectory( // swiftlint:disable:this function_body_length
 	}
 }
 
+public func copyAndStripFramework(
+	_ source: URL,
+	target: URL,
+	validArchitectures: [String],
+	strippingDebugSymbols: Bool = true,
+	queryingCodesignIdentityWith codesignIdentityQuery: SignalProducer<String?, CarthageError> = .init(value: nil),
+	copyingSymbolMapsInto symbolMapDestinationSignal: Result<URL, CarthageError>? = nil
+) -> SignalProducer<(), CarthageError> {
+	let strippedArchitectureData = architecturesInPackage(source)
+		.flatMap(.race) { (archs: [String]) in
+			nonDestructivelyStripArchitectures(source, Set(archs).subtracting(validArchitectures))
+		}
+
+	return SignalProducer.combineLatest(copyProduct(source, target), codesignIdentityQuery, strippedArchitectureData)
+		.flatMap(.merge) { url, codesigningIdentity, strippedArchitectureData -> SignalProducer<(), CarthageError> in
+			return SignalProducer(value: strippedArchitectureData.1.relativePath)
+				.attemptMap {
+					return Result(at: target.appendingPathComponent($0)) {
+						try strippedArchitectureData.0.write(to: $0)
+					}
+				}
+				.concat(strippingDebugSymbols ? stripDebugSymbols(target) : .empty)
+				.concat(stripHeadersDirectory(target))
+				.concat(stripPrivateHeadersDirectory(target))
+				.concat(stripModulesDirectory(target))
+				.concat(codesigningIdentity.map { codesign(target, $0) } ?? .empty)
+				.concat(
+					(symbolMapDestinationSignal?.producer ?? SignalProducer.empty)
+						.flatMap(.merge) {
+							BCSymbolMapsForFramework(source).copyFileURLsIntoDirectory($0)
+						}
+						.then(SignalProducer<(), CarthageError>.empty)
+				)
+		}
+}
+
 /// Strips a framework from unexpected architectures and potentially debug symbols,
 /// optionally codesigning the result.
 public func stripFramework(
@@ -1011,72 +1055,12 @@ public func stripDSYM(_ dSYMURL: URL, keepingArchitectures: [String]) -> SignalP
 }
 
 /// Strips a universal file from unexpected architectures.
-private func stripBinary(_ binaryURL: URL, keepingArchitectures: [String]) -> SignalProducer<(), CarthageError> {
-  // With a very complex build, where multiple application targets share Carthage output,
-  // there is a concurrency issue if two build phases running in parallel try to work on the
-  // same framework.
-  //
-  // In a nutshell:
-  //  pid 1094 copyProduct(MyFramework.framework)
-  //  pid 1094 stripArchitecture(armv7)
-  //  pid 1094 stripArchitecture(arm64)
-  //  pid 1684 copyProduct(MyFramework.framework)
-  //  pid 1684 stripArchitecture(armv7)
-  //  pid 1916 copyProduct(MyFramework.framework)
-  //  pid 1916 stripArchitecture(armv7)
-  //  pid 1684 stripArchitecture(arm64)
-  //  pid 1916 stripArchitecture(arm64)  <-- already stripped, so an error occurs
-  //
-  //  A shell task (/usr/bin/xcrun lipo -remove armv7 […] failed with exit code 1:
-  //  fatal error: […]MyFramework.framework does not contain that architecture
-  //
-  // So we copy it to /tmp, modify it there, and copy it back to the original
-  // location. Problem averted!
-  //
-  // Footnote: Turns out this works perfectly for _framework_s, but the dSYMs
-  // introduce a wrinkle: They are all copied to ($BUILT_PRODUCTS_DIR), regardless
-  // of where the frameworks go, so that whole lipo scenario still exists. After
-  // many overly-complex attemts to handle cross-process & cross-thread locking,
-  // I came up with a simplified solution.
-  //
-  // - Continue to do all the work in tmp
-  // - Check to see if the product in tmp is exactly the same as the destination
-  //   - If so, delete the temp file
-  //   - If not, overwrite the dest (this handles updates to an existing dSYM)
-  //
-
-  let fileManager = FileManager.default.reactive
-  
-  let createTempDir: SignalProducer<URL, CarthageError> = fileManager.createTemporaryDirectoryWithTemplate("carthage-lipo-XXXXXX")
-  
-  let copyItem: (URL, URL) -> SignalProducer<URL, CarthageError> = { source, dest in
-    fileManager.copyItem(source, into: dest)
-  }
-  
-  let strip: (URL, [String]) -> SignalProducer<URL, CarthageError> = { workspace, keeping in
-    return architecturesInPackage(workspace)
-      .filter { !keepingArchitectures.contains($0) }
-      .flatMap(.concat) { stripArchitecture(workspace, $0) }
-      .then(SignalProducer(value: workspace))
-  }
-  
-  let replace: (URL, URL) -> SignalProducer<(), CarthageError> = { original, modified in
-    return fileManager.replaceItem(at: original, withItemAt: modified)
-  }
-  
-  return createTempDir
-    .flatMap(.merge) { tempDir in
-      copyItem(binaryURL, tempDir)
-    }
-    .flatMap(.merge) { tempFile in
-      strip(tempFile, keepingArchitectures)
-    }
-    .filter { tempFile in
-      return !FileManager.default.contentsEqual(atPath: tempFile.path, andPath: binaryURL.path)
-    }
-    .flatMap(.merge) { tempFile in
-      replace(binaryURL, tempFile)
-  }
+private func stripBinary(_ packageURL: URL, keepingArchitectures: [String]) -> SignalProducer<(), CarthageError> {
+	return architecturesInPackage(packageURL)
+		.flatMap(.race) { (packageArchs: [String]) in
+            stripArchitectures(packageURL, Set(packageArchs).subtracting(keepingArchitectures))
+				.then(SignalProducer<(), CarthageError>(value: ()))
+		}
 }
 
 /// Copies a product into the given folder. The folder will be created if it
@@ -1184,74 +1168,132 @@ extension Signal where Value: TaskEventType {
 	}
 }
 
-/// Strips the given architecture from a framework.
-private func stripArchitecture(_ frameworkURL: URL, _ architecture: String) -> SignalProducer<(), CarthageError> {
-	return SignalProducer<URL, CarthageError> { () -> Result<URL, CarthageError> in binaryURL(frameworkURL) }
-		.flatMap(.merge) { binaryURL -> SignalProducer<TaskEvent<Data>, CarthageError> in
-			let lipoTask = Task("/usr/bin/xcrun", arguments: ["lipo", "-remove", architecture, "-output", binaryURL.path, binaryURL.path])
-			return lipoTask.launch()
-				.mapError(CarthageError.taskError)
+public func nonDestructivelyStripArchitectures(_ frameworkURL: URL, _ architectures: Set<String>) -> SignalProducer<(Data, URL), CarthageError> {
+	return SignalProducer(value: frameworkURL)
+		.attemptMap(binaryURL)
+		.attemptMap {
+			let frameworkPathComponents = sequence(state: frameworkURL.absoluteURL.pathComponents.makeIterator(), next: {
+				$0.next() ?? ""
+			})
+
+			let suffix = zip(frameworkPathComponents, $0.pathComponents).drop(while: { $0 == $1 })
+
+			if suffix.contains(where: { $0.0 != "" }) {
+				return .failure(CarthageError.internalError(description: "In attempt to read NSBundle «\(frameworkURL.absoluteString)»'s binary url, could not relativize «\($0.debugDescription)» against «\(frameworkURL.absoluteString)»."))
+			}
+			return Result(
+				URLComponents(string: suffix.map { $0.1 }.joined(separator: "/"))?
+					.url(relativeTo: frameworkURL.absoluteURL.appendingPathComponent("/")),
+				failWith: CarthageError.internalError(description: "In attempt to read NSBundle «\(frameworkURL.absoluteString)»'s binary url, could not relativize «\($0.debugDescription)» against «\(frameworkURL.absoluteString)».")
+			)
 		}
-		.then(SignalProducer<(), CarthageError>.empty)
+		.zip(with: FileManager.default.reactive.createTemporaryDirectoryWithTemplate("carthage-lipo-XXXXXX"))
+		.flatMap(.race) { (relativeBinaryURL: URL, tempDir: URL) -> SignalProducer<(Data, URL), CarthageError> in
+			let outputURL = URL(string: relativeBinaryURL.relativePath, relativeTo: tempDir)!
+
+			let arguments = [
+				[ relativeBinaryURL.absoluteURL.path ],
+				architectures.flatMap { [ "-remove", $0 ] },
+				[ "-output", outputURL.path ],
+			].reduce(into: ["lipo"]) { $0.append(contentsOf: $1) }
+
+			let task = Task("/usr/bin/xcrun", arguments: arguments)
+				.launch()
+				.attempt { _ in
+					try? FileManager.default.createDirectory(at: outputURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+					return .success(())
+				}
+				.mapError(CarthageError.taskError)
+
+			let result: SignalProducer<(Data, URL), CarthageError> = SignalProducer(value: outputURL)
+				.attemptMap {
+					Result(at: $0, carthageError: CarthageError.readFailed) { url in
+						defer { try? FileManager.default.removeItem(at: url) }
+						return try Data(contentsOf: url)
+					}
+						.fanout(.success(relativeBinaryURL))
+				}
+
+			return task.then(result)
+		}
 }
 
-/// Returns a signal of all architectures present in a given package.
-public func architecturesInPackage(_ packageURL: URL) -> SignalProducer<String, CarthageError> {
+/// Strips the given architectures from a framework.
+private func stripArchitectures(_ packageURL: URL, _ architectures: Set<String>) -> SignalProducer<(), CarthageError> {
 	return SignalProducer<URL, CarthageError> { () -> Result<URL, CarthageError> in binaryURL(packageURL) }
-		.flatMap(.merge) { binaryURL -> SignalProducer<String, CarthageError> in
-			let lipoTask = Task("/usr/bin/xcrun", arguments: [ "lipo", "-info", binaryURL.path])
+		.flatMap(.merge) { binaryURL -> SignalProducer<(), CarthageError> in
+			let arguments = [
+				[ binaryURL.absoluteURL.path ],
+				architectures.flatMap { [ "-remove", $0 ] },
+				[ "-output",  binaryURL.absoluteURL.path ],
+			].reduce(into: ["lipo"]) { $0.append(contentsOf: $1) }
 
-			return lipoTask.launch()
-				.ignoreTaskData()
+			let lipoTask = Task("/usr/bin/xcrun", arguments: arguments)
+			return lipoTask
+				.launch()
 				.mapError(CarthageError.taskError)
-				.map { String(data: $0, encoding: .utf8) ?? "" }
-				.flatMap(.merge) { output -> SignalProducer<String, CarthageError> in
-					var characterSet = CharacterSet.alphanumerics
-					characterSet.insert(charactersIn: " _-")
-
-					let scanner = Scanner(string: output)
-
-					if scanner.scanString("Architectures in the fat file:", into: nil) {
-						// The output of "lipo -info PathToBinary" for fat files
-						// looks roughly like so:
-						//
-						//     Architectures in the fat file: PathToBinary are: armv7 arm64
-						//
-						var architectures: NSString?
-
-						scanner.scanString(binaryURL.path, into: nil)
-						scanner.scanString("are:", into: nil)
-						scanner.scanCharacters(from: characterSet, into: &architectures)
-
-						let components = architectures?
-							.components(separatedBy: " ")
-							.filter { !$0.isEmpty }
-
-						if let components = components {
-							return SignalProducer(components)
-						}
-					}
-
-					if scanner.scanString("Non-fat file:", into: nil) {
-						// The output of "lipo -info PathToBinary" for thin
-						// files looks roughly like so:
-						//
-						//     Non-fat file: PathToBinary is architecture: x86_64
-						//
-						var architecture: NSString?
-
-						scanner.scanString(binaryURL.path, into: nil)
-						scanner.scanString("is architecture:", into: nil)
-						scanner.scanCharacters(from: characterSet, into: &architecture)
-
-						if let architecture = architecture {
-							return SignalProducer(value: architecture as String)
-						}
-					}
-
-					return SignalProducer(error: .invalidArchitectures(description: "Could not read architectures from \(packageURL.path)"))
-				}
+				.then(SignalProducer<(), CarthageError>.empty)
 		}
+}
+
+// Returns a signal of all architectures present in a given package.
+public func architecturesInPackage(_ packageURL: URL, xcrunQuery: [String] = ["lipo", "-info"]) -> SignalProducer<[String], CarthageError> {
+	let binaryURLResult = binaryURL(packageURL)
+	guard let binaryURL = binaryURLResult.value else { return SignalProducer(error: binaryURLResult.error!) }
+
+	return Task("/usr/bin/xcrun", arguments: xcrunQuery + [binaryURL.path])
+		.launch()
+		.ignoreTaskData()
+		.mapError(CarthageError.taskError)
+		.map { String(data: $0, encoding: .utf8) ?? "" }
+		.attemptMap { output -> Result<[String], CarthageError> in
+			var characterSet = CharacterSet.alphanumerics
+			characterSet.insert(charactersIn: " _-")
+
+			let scanner = Scanner(string: output)
+
+			if scanner.scanString("Architectures in the fat file:", into: nil) {
+				// The output of "lipo -info PathToBinary" for fat files
+				// looks roughly like so:
+				//
+				//     Architectures in the fat file: PathToBinary are: armv7 arm64
+				//
+				var architectures: NSString?
+
+				scanner.scanString(binaryURL.path, into: nil)
+				scanner.scanString("are:", into: nil)
+				scanner.scanCharacters(from: characterSet, into: &architectures)
+
+				let components = architectures?
+					.components(separatedBy: " ")
+					.filter { !$0.isEmpty }
+
+				if let components = components {
+					return .success(components)
+				}
+			}
+
+			if scanner.scanString("Non-fat file:", into: nil) {
+				// The output of "lipo -info PathToBinary" for thin
+				// files looks roughly like so:
+				//
+				//     Non-fat file: PathToBinary is architecture: x86_64
+				//
+				var architecture: NSString?
+
+				scanner.scanString(binaryURL.path, into: nil)
+				scanner.scanString("is architecture:", into: nil)
+				scanner.scanCharacters(from: characterSet, into: &architecture)
+
+				if let architecture = architecture {
+					return .success([architecture.replacingOccurrences(of: "\0", with: "")])
+				}
+			}
+
+			// think I changed the output of the below error (which used to use packageURL.path)
+			return .failure(.invalidArchitectures(description: "Could not read architectures from \(packageURL.path)"))
+		}
+		.reduce(into: [] as [String]) { $0.append(contentsOf: $1 as [String]) }
 }
 
 /// Strips debug symbols from the given framework
@@ -1379,13 +1421,29 @@ public func binaryURL(_ packageURL: URL) -> Result<URL, CarthageError> {
 
 	if bundle?.packageType == .dSYM {
 		let binaryName = packageURL.deletingPathExtension().deletingPathExtension().lastPathComponent
-		if !binaryName.isEmpty {
+		if binaryName.isEmpty {
+			return .failure(.readFailed(packageURL, NSError(
+				domain: NSCocoaErrorDomain,
+				code: CocoaError.fileReadInvalidFileName.rawValue,
+				userInfo: [
+					NSLocalizedDescriptionKey: "dSYM has an invalid filename",
+					NSLocalizedRecoverySuggestionErrorKey: "Make sure your dSYM filename conforms to 'name.framework.dSYM' format"
+				]
+			)))
+		} else {
 			let binaryURL = packageURL.appendingPathComponent("Contents/Resources/DWARF/\(binaryName)")
 			return .success(binaryURL)
 		}
 	}
 
-	return .failure(.readFailed(packageURL, nil))
+	return .failure(.readFailed(packageURL, NSError(
+		domain: NSCocoaErrorDomain,
+		code: CocoaError.fileReadCorruptFile.rawValue,
+		userInfo: [
+			NSLocalizedDescriptionKey: "Cannot retrive binary file from bundle at \(packageURL)",
+			NSLocalizedRecoverySuggestionErrorKey: "Does the bundle contain an Info.plist?"
+		]
+	)))
 }
 
 /// Signs a framework with the given codesigning identity.

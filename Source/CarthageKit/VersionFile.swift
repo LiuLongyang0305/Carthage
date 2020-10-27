@@ -4,22 +4,41 @@ import ReactiveTask
 import Result
 import XCDBLD
 
-struct CachedFramework: Codable {
+/// A representation of the cached frameworks
+public struct CachedFramework: Codable {
 	enum CodingKeys: String, CodingKey {
 		case name = "name"
 		case hash = "hash"
+		case linking = "linking"
 		case swiftToolchainVersion = "swiftToolchainVersion"
 	}
 
-	let name: String
-	let hash: String
-	let swiftToolchainVersion: String?
-	var isSwiftFramework: Bool {
+	/// Name of the framework
+	public let name: String
+	/// Hash of the framework
+	public let hash: String
+    /// The linking type of the framework. One of `dynamic` or `static`. Defaults to `dynamic`
+    public let linking: FrameworkType?
+	/// The Swift toolchain version used to build the framework
+	public let swiftToolchainVersion: String?
+	/// Indicates if the framework is built from swift code
+	public var isSwiftFramework: Bool {
 		return swiftToolchainVersion != nil
+	}
+
+	/// The framework's expected location within a platform directory.
+	var relativePath: String {
+		switch linking {
+		case .some(.static):
+			return "\(FrameworkType.staticFolderName)/\(name).framework"
+		default:
+			return "\(name).framework"
+		}
 	}
 }
 
-struct VersionFile: Codable {
+/// The representation for a version file
+public struct VersionFile: Codable {
 	enum CodingKeys: String, CodingKey {
 		case commitish = "commitish"
 		case macOS = "Mac"
@@ -28,33 +47,41 @@ struct VersionFile: Codable {
 		case tvOS = "tvOS"
 	}
 
-	let commitish: String
-
-	let macOS: [CachedFramework]?
-	let iOS: [CachedFramework]?
-	let watchOS: [CachedFramework]?
-	let tvOS: [CachedFramework]?
+	/// The revision of the dependency (usually a version number)
+	public let commitish: String
+	/// The macOS cached frameworks
+	public let macOS: [CachedFramework]?
+	/// The iOS cached frameworks
+	public let iOS: [CachedFramework]?
+	/// The watchOS cached frameworks
+	public let watchOS: [CachedFramework]?
+	/// The tvOS cached frameworks
+	public let tvOS: [CachedFramework]?
 
 	/// The extension representing a serialized VersionFile.
 	static let pathExtension = "version"
 
-	subscript(_ platform: Platform) -> [CachedFramework]? {
-		switch platform {
-		case .macOS:
+	subscript(_ platform: SDK) -> [CachedFramework]? {
+		switch platform.platformSimulatorlessFromHeuristic {
+		case "Mac":
 			return macOS
 
-		case .iOS:
+		case "iOS":
 			return iOS
 
-		case .watchOS:
+		case "watchOS":
 			return watchOS
 
-		case .tvOS:
+		case "tvOS":
 			return tvOS
+			
+		default:
+			return nil
 		}
 	}
 
-	init(
+	/// Initializes a version file from some values
+	public init(
 		commitish: String,
 		macOS: [CachedFramework]?,
 		iOS: [CachedFramework]?,
@@ -68,7 +95,9 @@ struct VersionFile: Codable {
 		self.tvOS = tvOS
 	}
 
-	init?(url: URL) {
+	/// Initializes a version file from the content of a file
+	/// - Parameter url: the path to the file
+	public init?(url: URL) {
 		guard
 			FileManager.default.fileExists(atPath: url.path),
 			let jsonData = try? Data(contentsOf: url),
@@ -79,20 +108,42 @@ struct VersionFile: Codable {
 		self = versionFile
 	}
 
-	func frameworkURL(
+	/// Calculates the path of the version file corresponding with a dependency
+	/// - Parameters:
+	///   - dependency: the dependency
+	///   - rootDirectoryURL: the path to the root directory
+	public static func url(for dependency: Dependency, rootDirectoryURL: URL) -> URL {
+		let rootBinariesURL = rootDirectoryURL
+			.appendingPathComponent(Constants.binariesFolderPath, isDirectory: true)
+			.resolvingSymlinksInPath()
+		return rootBinariesURL
+			.appendingPathComponent(".\(dependency.name).\(VersionFile.pathExtension)")
+	}
+
+	/// Calculates the path of the framework corresponding with a version file
+	/// - Parameters:
+	///   - cachedFramework: the cached framework used to calculate the path
+	///   - platform: the platform to use
+	///   - binariesDirectoryURL: the binaries directory
+	public func frameworkURL(
 		for cachedFramework: CachedFramework,
-		platform: Platform,
+		platform: SDK,
 		binariesDirectoryURL: URL
 	) -> URL {
 		return binariesDirectoryURL
-			.appendingPathComponent(platform.rawValue, isDirectory: true)
+			.appendingPathComponent(platform.platformSimulatorlessFromHeuristic, isDirectory: true)
 			.resolvingSymlinksInPath()
-			.appendingPathComponent("\(cachedFramework.name).framework", isDirectory: true)
+			.appendingPathComponent(cachedFramework.relativePath, isDirectory: true)
 	}
 
-	func frameworkBinaryURL(
+	/// Calculates the path of the binary inside the framework corresponding with a version file
+	/// - Parameters:
+	///   - cachedFramework: the cached framework used to calculate the path
+	///   - platform: the platform to use
+	///   - binariesDirectoryURL: the binaries directory
+	public func frameworkBinaryURL(
 		for cachedFramework: CachedFramework,
-		platform: Platform,
+		platform: SDK,
 		binariesDirectoryURL: URL
 	) -> URL {
 		return frameworkURL(
@@ -105,9 +156,9 @@ struct VersionFile: Codable {
 
 	/// Sends the hashes of the provided cached framework's binaries in the
 	/// order that they were provided in.
-	func hashes(
+	public func hashes(
 		for cachedFrameworks: [CachedFramework],
-		platform: Platform,
+		platform: SDK,
 		binariesDirectoryURL: URL
 	) -> SignalProducer<String?, CarthageError> {
 		return SignalProducer<CachedFramework, CarthageError>(cachedFrameworks)
@@ -134,9 +185,9 @@ struct VersionFile: Codable {
 	///
 	/// Non-Swift frameworks are considered as matching the local Swift version,
 	/// as they will be compatible with it by definition.
-	func swiftVersionMatches(
+	public func swiftVersionMatches(
 		for cachedFrameworks: [CachedFramework],
-		platform: Platform,
+		platform: SDK,
 		binariesDirectoryURL: URL,
 		localSwiftVersion: String
 	) -> SignalProducer<Bool, CarthageError> {
@@ -152,17 +203,17 @@ struct VersionFile: Codable {
 					return SignalProducer(value: true)
 				} else {
 					return frameworkSwiftVersion(frameworkURL)
-						.flatMapError { _ in dSYMSwiftVersion(frameworkURL.appendingPathExtension("dSYM")) }
 						.map { swiftVersion -> Bool in
-							return swiftVersion == localSwiftVersion
+							return swiftVersion == localSwiftVersion || isModuleStableAPI(localSwiftVersion, swiftVersion, frameworkURL)
 						}
 						.flatMapError { _ in SignalProducer<Bool, CarthageError>(value: false) }
 				}
 			}
 	}
 
-	func satisfies(
-		platform: Platform,
+	/// Check if the version file matches its values with the ones provided
+	public func satisfies(
+		platform: SDK,
 		commitish: String,
 		binariesDirectoryURL: URL,
 		localSwiftVersion: String
@@ -196,8 +247,9 @@ struct VersionFile: Codable {
 			}
 	}
 
-	func satisfies(
-		platform: Platform,
+	/// Check if the version file matches its values with the ones provided
+	public func satisfies(
+		platform: SDK,
 		commitish: String,
 		hashes: [String?],
 		swiftVersionMatches: [Bool]
@@ -224,7 +276,8 @@ struct VersionFile: Codable {
 			}
 	}
 
-	func write(to url: URL) -> Result<(), CarthageError> {
+	/// Writes the version file to the provided path
+	public func write(to url: URL) -> Result<(), CarthageError> {
 		return Result(at: url, attempt: {
 			let encoder = JSONEncoder()
 			encoder.outputFormatting = .prettyPrinted
@@ -251,7 +304,7 @@ struct VersionFile: Codable {
 ///
 /// Returns a signal that succeeds once the file has been created.
 public func createVersionFileForCurrentProject(
-	platforms: Set<Platform>,
+	platforms: Set<SDK>?,
 	buildProducts: [URL],
 	rootDirectoryURL: URL
 ) -> SignalProducer<(), CarthageError> {
@@ -298,7 +351,7 @@ public func createVersionFileForCurrentProject(
 		}
 		// Pick "origin" if it exists,
 		// otherwise sort remotes by popularity
-	    // or alphabetically in case of a draw
+		// or alphabetically in case of a draw
 		.map { (remotePopularityMap: [String: (popularity: Int, remoteNameAndURL: (name: String, url: String))]) -> String in
 			guard let origin = remotePopularityMap["origin"] else {
 				let urlOfMostPopularRemote = remotePopularityMap.sorted { lhs, rhs in
@@ -346,7 +399,7 @@ public func createVersionFileForCurrentProject(
 public func createVersionFile(
 	for dependency: Dependency,
 	version: PinnedVersion,
-	platforms: Set<Platform>,
+	platforms: Set<SDK>?,
 	buildProducts: [URL],
 	rootDirectoryURL: URL
 ) -> SignalProducer<(), CarthageError> {
@@ -372,12 +425,22 @@ private func createVersionFile(
 		let versionFileURL = rootBinariesURL
 			.appendingPathComponent(".\(dependencyName).\(VersionFile.pathExtension)")
 
+		let knownIn2019YearSDK: (String) -> String = { prefix in
+			SDK.knownIn2019YearSDKs
+				.first(where: { sdk in sdk.rawValue.hasPrefix(prefix) } )!
+				.platformSimulatorlessFromHeuristic
+		}
+
+		let sortedFrameworks: ([CachedFramework]?) -> [CachedFramework]? = {
+			$0?.sorted { $0.name < $1.name }
+		}
+
 		let versionFile = VersionFile(
 			commitish: commitish,
-			macOS: platformCaches[Platform.macOS.rawValue],
-			iOS: platformCaches[Platform.iOS.rawValue],
-			watchOS: platformCaches[Platform.watchOS.rawValue],
-			tvOS: platformCaches[Platform.tvOS.rawValue])
+			macOS: sortedFrameworks(platformCaches[knownIn2019YearSDK("mac")]),
+			iOS: sortedFrameworks(platformCaches[knownIn2019YearSDK("iphoneos")]),
+			watchOS: sortedFrameworks(platformCaches[knownIn2019YearSDK("watchos")]),
+			tvOS: sortedFrameworks(platformCaches[knownIn2019YearSDK("appletvos")]))
 
 		return versionFile.write(to: versionFileURL)
 	}
@@ -392,34 +455,53 @@ private func createVersionFile(
 public func createVersionFileForCommitish(
 	_ commitish: String,
 	dependencyName: String,
-	platforms: Set<Platform> = Set(Platform.supportedPlatforms),
+	platforms: Set<SDK>? = nil,
 	buildProducts: [URL],
 	rootDirectoryURL: URL
 ) -> SignalProducer<(), CarthageError> {
 	var platformCaches: [String: [CachedFramework]] = [:]
 
-	let platformsToCache = platforms.isEmpty ? Set(Platform.supportedPlatforms) : platforms
+	let platformsToCache = (platforms ?? SDK.knownIn2019YearSDKs).intersection(SDK.knownIn2019YearSDKs)
+
 	for platform in platformsToCache {
-		platformCaches[platform.rawValue] = []
+		platformCaches[platform.platformSimulatorlessFromHeuristic] = []
 	}
 
 	struct FrameworkDetail {
 		let platformName: String
 		let frameworkName: String
 		let frameworkSwiftVersion: String?
+		let frameworkType: FrameworkType
 	}
 
 	if !buildProducts.isEmpty {
 		return SignalProducer<URL, CarthageError>(buildProducts)
 			.flatMap(.merge) { url -> SignalProducer<(String, FrameworkDetail), CarthageError> in
-				let frameworkName = url.deletingPathExtension().lastPathComponent
-				let platformName = url.deletingLastPathComponent().lastPathComponent
+				let frameworkName: String
+				let platformName: String
+				let frameworkType: FrameworkType
+				switch (
+					url.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent,
+					url.deletingLastPathComponent().lastPathComponent,
+					url.deletingPathExtension().lastPathComponent
+				) {
+				case (let platform, FrameworkType.staticFolderName, let name):
+					frameworkName = name
+					platformName = platform
+					frameworkType = .static
+				case (_, let platform, let name):
+					frameworkName = name
+					platformName = platform
+					frameworkType = .dynamic
+				}
+
 				return frameworkSwiftVersionIfIsSwiftFramework(url)
 					.mapError { swiftVersionError -> CarthageError in .unknownFrameworkSwiftVersion(swiftVersionError.description) }
 					.flatMap(.merge) { frameworkSwiftVersion -> SignalProducer<(String, FrameworkDetail), CarthageError> in
 					let frameworkDetail: FrameworkDetail = .init(platformName: platformName,
 										     frameworkName: frameworkName,
-										     frameworkSwiftVersion: frameworkSwiftVersion)
+										     frameworkSwiftVersion: frameworkSwiftVersion,
+										     frameworkType: frameworkType)
 					let details = SignalProducer<FrameworkDetail, CarthageError>(value: frameworkDetail)
 					let binaryURL = url.appendingPathComponent(frameworkName, isDirectory: false)
 					return SignalProducer.zip(hashForFileAtURL(binaryURL), details)
@@ -430,8 +512,9 @@ public func createVersionFileForCommitish(
 				let platformName = values.1.platformName
 				let frameworkName = values.1.frameworkName
 				let frameworkSwiftVersion = values.1.frameworkSwiftVersion
+				let frameworkType = values.1.frameworkType
 
-				let cachedFramework = CachedFramework(name: frameworkName, hash: hash, swiftToolchainVersion: frameworkSwiftVersion)
+				let cachedFramework = CachedFramework(name: frameworkName, hash: hash, linking: frameworkType, swiftToolchainVersion: frameworkSwiftVersion)
 				if var frameworks = platformCaches[platformName] {
 					frameworks.append(cachedFramework)
 					platformCaches[platformName] = frameworks
@@ -468,27 +551,27 @@ public func createVersionFileForCommitish(
 public func versionFileMatches(
 	_ dependency: Dependency,
 	version: PinnedVersion,
-	platforms: Set<Platform>,
+	platforms: Set<SDK>?,
 	rootDirectoryURL: URL,
 	toolchain: String?
 ) -> SignalProducer<Bool?, CarthageError> {
-	let rootBinariesURL = rootDirectoryURL
-		.appendingPathComponent(Constants.binariesFolderPath, isDirectory: true)
-		.resolvingSymlinksInPath()
-	let versionFileURL = rootBinariesURL
-		.appendingPathComponent(".\(dependency.name).\(VersionFile.pathExtension)")
+	let versionFileURL = VersionFile.url(for: dependency, rootDirectoryURL: rootDirectoryURL)
 	guard let versionFile = VersionFile(url: versionFileURL) else {
 		return SignalProducer(value: nil)
 	}
 
 	let commitish = version.commitish
 
-	let platformsToCheck = platforms.isEmpty ? Set<Platform>(Platform.supportedPlatforms) : platforms
+	let platformsToCheck = (platforms ?? SDK.knownIn2019YearSDKs).intersection(SDK.knownIn2019YearSDKs)
+
+	let rootBinariesURL = rootDirectoryURL
+		.appendingPathComponent(Constants.binariesFolderPath, isDirectory: true)
+		.resolvingSymlinksInPath()
 
 	return swiftVersion(usingToolchain: toolchain)
 		.mapError { error in CarthageError.internalError(description: error.description) }
 		.flatMap(.concat) { localSwiftVersion in
-			return SignalProducer<Platform, CarthageError>(platformsToCheck)
+			return SignalProducer<SDK, CarthageError>(platformsToCheck)
 				.flatMap(.merge) { platform in
 					return versionFile.satisfies(
 						platform: platform,

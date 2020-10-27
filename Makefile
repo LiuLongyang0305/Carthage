@@ -7,10 +7,9 @@ INTERNAL_PACKAGE=CarthageApp.pkg
 OUTPUT_PACKAGE=Carthage.pkg
 
 CARTHAGE_EXECUTABLE=./.build/release/carthage
-BINARIES_FOLDER=/usr/local/bin
+BINARIES_FOLDER=$(PREFIX)/bin
 
-PWD := $(shell pwd)
-SWIFT_BUILD_FLAGS=--skip-update --configuration release -Xswiftc -suppress-warnings
+SWIFT_BUILD_FLAGS=--configuration release -Xswiftc -suppress-warnings
 
 SWIFTPM_DISABLE_SANDBOX_SHOULD_BE_FLAGGED:=$(shell test -n "$${HOMEBREW_SDKROOT}" && echo should_be_flagged)
 ifeq ($(SWIFTPM_DISABLE_SANDBOX_SHOULD_BE_FLAGGED), should_be_flagged)
@@ -34,26 +33,27 @@ MKDIR=mkdir -p
 SUDO=sudo
 CP=cp
 
+ifdef DISABLE_SUDO
+override SUDO:=
+endif
+
 .PHONY: all clean install package test uninstall xcconfig xcodeproj
 
 all: installables
 
 clean:
 	swift package clean
-	swift package reset
 
 test:
 	$(RM_SAFELY) ./.build/debug/CarthagePackageTests.xctest
-	swift package --skip-update resolve
-	swift build --skip-update --build-tests -Xswiftc -suppress-warnings -Xswiftc -Xcc -Xswiftc -fmodule-map-file=$(PWD)/`find .build/checkouts -name "swift-llbuild.git*"`/products/libllbuild/include/module.modulemap
+	swift build --build-tests -Xswiftc -suppress-warnings
 	$(CP) -R Tests/CarthageKitTests/Resources ./.build/debug/CarthagePackageTests.xctest/Contents
 	$(CP) Tests/CarthageKitTests/fixtures/CartfilePrivateOnly.zip ./.build/debug/CarthagePackageTests.xctest/Contents/Resources
 	script/copy-fixtures ./.build/debug/CarthagePackageTests.xctest/Contents/Resources
 	swift test --skip-build
 
 installables:
-	swift package --skip-update resolve
-	swift build $(SWIFT_BUILD_FLAGS) -Xswiftc -Xcc -Xswiftc -fmodule-map-file=$(PWD)/`find .build/checkouts -name "swift-llbuild.git*"`/products/libllbuild/include/module.modulemap
+	swift build $(SWIFT_BUILD_FLAGS)
 
 package: installables
 	$(MKDIR) "$(CARTHAGE_TEMPORARY_FOLDER)$(BINARIES_FOLDER)"
@@ -72,21 +72,15 @@ package: installables
 	   	"$(OUTPUT_PACKAGE)"
 
 prefix_install: installables
-	$(MKDIR) "$(PREFIX)/bin"
-	$(CP) -f "$(CARTHAGE_EXECUTABLE)" "$(PREFIX)/bin/"
+	$(MKDIR) "$(BINARIES_FOLDER)"
+	$(CP) -f "$(CARTHAGE_EXECUTABLE)" "$(BINARIES_FOLDER)/"
 
 install: installables
+	if [ ! -d "$(BINARIES_FOLDER)" ]; then $(SUDO) $(MKDIR) "$(BINARIES_FOLDER)"; fi
 	$(SUDO) $(CP) -f "$(CARTHAGE_EXECUTABLE)" "$(BINARIES_FOLDER)"
 
 uninstall:
 	$(RM) "$(BINARIES_FOLDER)/carthage"
 	
-.build/libSwiftPM.xcconfig:
-	mkdir -p .build
-	echo "OTHER_LDFLAGS = -lncurses -lsqlite3" > "$@"
-	echo "OTHER_CFLAGS = -DSWIFT_PACKAGE" >> "$@"
-
-xcconfig: .build/libSwiftPM.xcconfig
-
-xcodeproj: xcconfig
-	 swift package generate-xcodeproj --xcconfig-overrides .build/libSwiftPM.xcconfig
+xcodeproj:
+	 swift package generate-xcodeproj
